@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Dispatch a task card to a cheap worker via Hermes Agent one-shot mode.
+#   delegate gemma  <task.md> [workdir]   -> local Gemma 4 E4B (llama-server :8080)
+#   delegate hermes <task.md> [workdir]   -> OpenRouter GLM (override with $HERMES_WORKER_MODEL)
+# Full transcript goes to a log file; stdout carries only the worker's short report,
+# so the orchestrator (Claude Code) spends few tokens reading results.
+# After the worker finishes, the card's `Acceptance: \`<cmd>\`` command is run in workdir
+# and reported as ACCEPT: PASS/FAIL, so the orchestrator needs no separate verify turn.
+# hermes tier falls back to local Gemma when OpenRouter has no credits (DELEGATE_NO_FALLBACK=1 disables).
+# Opt-in: DELEGATE_YOLO=1 skips Hermes' dangerous-command approval prompts.
+# Opt-in: DELEGATE_TOOLSETS overrides the trimmed toolset (default file,terminal).
+set -euo pipefail
+
+tier="${1:?usage: delegate <gemma|hermes> <task.md> [workdir]}"
+task="${2:?usage: delegate <gemma|hermes> <task.md> [workdir]}"
+workdir="${3:-$PWD}"
+[[ -f "$task" ]] || { echo "STATUS: error - task file not found: $task"; exit 2; }
+
+# OpenRouter balance check (total_credits - total_usage). Prints the balance; empty on error.
+openrouter_balance() {
+  local key
+  key="$(grep -E '^OPENROUTER_API_KEY=' "$HOME/.hermes/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")"
+  [[ -n "$key" ]] || return 0
+  curl -s -m 5 https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $key" \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin)["data"];print(d["total_credits"]-d["total_usage"])' 2>/dev/null
+}
+
+gemma_args() {
+  gemma-up 2>/dev/null \
+    || { echo "STATUS: error - llama-server failed to start, see ~/.cache/delegate/llama-server.log"; exit 3; }
+  args=(--provider localgemma -m gemma-4-E4B)
+}
+
+fallback=""
+case "$tier" in
+  gemma) gemma_args ;;
+  hermes)
+    # No OpenRouter credits -> run on local Gemma instead of failing (DELEGATE_NO_FALLBACK=1 disables).
+    bal="$(openrouter_balance)"
+    if [[ "${DELEGATE_NO_FALLBACK:-0}" != 1 && -n "$bal" ]] && python3 -c "import sys;sys.exit(0 if float('$bal')<=0 else 1)"; then
+      fallback="hermes->gemma (OpenRouter balance \$$bal)"
+      gemma_args
+    else
+      args=(-m "${HERMES_WORKER_MODEL:-z-ai/glm-5.3-flash}")
+    fi
+    ;;
+  *) echo "STATUS: error - unknown tier: $tier"; exit 2 ;;
+esac
+# Trimmed prompt (see run_worker): no memory/rules/skills, only file + terminal tools
+# (~12.6K -> ~4.6K tokens per call).
+
+logdir="$HOME/.cache/delegate"; mkdir -p "$logdir"
+stamp="$(date +%Y%m%d-%H%M%S)-$tier-$(basename "$task" .md)"
+log="$logdir/$stamp.log"
+usage="$logdir/$stamp.usage.json"
+
+prompt="$(cat "$task")
+
+---
+Do the real task. Do not create files, stub code or edit tests just to make the acceptance command pass.
+When finished, end your reply with this report and nothing after it:
+STATUS: done | partial | failed
+FILES: <paths changed, comma-separated, or none>
+CHECK: <command you ran to verify, and its result in one line>
+NOTE: <one line: blocker or anything the reviewer must know>"
+
+# Time limit: a worker run that hangs is killed after DELEGATE_TIMEOUT seconds (default 600).
+# A timed-out run prints TIMEOUT, skips the acceptance check, and exits non-zero -> the
+# orchestrator's normal retry path handles it, same as any other failure.
+timed_out=no
+run_worker() {
+  local tmo="${DELEGATE_TIMEOUT:-600}"
+  set +e
+  timeout -k 10 "$tmo" hermes -z "$prompt" --in "$workdir" --usage-file "$usage" "${args[@]}" "${extra[@]}" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then timed_out=yes; rc=124; fi
+}
+extra=(--ignore-rules -t "${DELEGATE_TOOLSETS:-file,terminal}")
+[[ "${DELEGATE_YOLO:-0}" == 1 ]] && extra+=(--yolo)
+run_worker
+
+# Billing error mid-run (balance check missed it) -> retry once on Gemma.
+if [[ "$tier" == hermes && -z "$fallback" && "${DELEGATE_NO_FALLBACK:-0}" != 1 ]] \
+   && grep -q -i -E 'add credits|insufficient credits|402' "$log"; then
+  fallback="hermes->gemma (OpenRouter billing error)"
+  mv "$log" "$log.openrouter-failed"
+  gemma_args
+  run_worker
+fi
+
+# Print only the report block (fallback: last 8 lines) plus where the full log lives.
+sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '/^STATUS:/{p=1} p' | tail -n 8 > "$log.report"
+[[ -s "$log.report" ]] || sed 's/\x1b\[[0-9;]*m//g' "$log" | tail -n 8 > "$log.report"
+cat "$log.report"
+[[ -n "$fallback" ]] && echo "FALLBACK: $fallback"
+
+# Run the card's acceptance command (first backticked command on the Acceptance: line).
+# Timed out -> report it and skip the acceptance check (the workdir state is unknown,
+# and without ACCEPT: PASS run-plan counts the card as FAIL and retries it as usual).
+accept="$(grep -m1 '^Acceptance:' "$task" | sed -n 's/^[^`]*`\([^`]*\)`.*/\1/p')"
+if [[ "$timed_out" == yes ]]; then
+  echo "TIMEOUT: worker killed after ${DELEGATE_TIMEOUT:-600}s (log: $log)"
+elif [[ -n "$accept" ]]; then
+  out="$(cd "$workdir" && perl -e 'alarm 300; exec @ARGV' bash -c "$accept" 2>&1)" && arc=0 || arc=$?
+  if [[ $arc -eq 0 ]]; then verdict=PASS; else verdict=FAIL; fi
+  echo "ACCEPT: $verdict (exit $arc) \`$accept\` -> $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-200)"
+else
+  echo "ACCEPT: none (no backticked command on Acceptance: line)"
+fi
+echo "LOG: $log (exit $rc)"
+exit "$rc"

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Start local Gemma llama-server on :8080 (64K ctx, Hermes minimum) if not already up.
+# Waits until healthy (max 90 s). Exit 0 = up, 3 = failed.
+set -uo pipefail
+health() { curl -sf -m 2 http://127.0.0.1:8080/health >/dev/null; }
+health && exit 0
+mkdir -p "$HOME/.cache/delegate"
+pgrep -f "llama-server -m $HOME/models/gemma" >/dev/null || \
+  nohup llama-server -m "$HOME/models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" \
+    --port 8080 -c 65536 -np 1 -ctk q8_0 -ctv q8_0 --jinja --reasoning-budget 0 \
+    >"$HOME/.cache/delegate/llama-server.log" 2>&1 &
+for _ in $(seq 1 90); do health && exit 0; sleep 1; done
+echo "gemma-up: llama-server failed to start, see ~/.cache/delegate/llama-server.log" >&2
+exit 3

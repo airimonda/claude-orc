@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Run every task card in tasks/ through `delegate`, with no Claude in the loop.
+
+    run-plan [tasks_dir]        (default: tasks)
+
+Card headers it reads (all optional except Acceptance):
+    Tier: hermes | gemma        (default hermes)
+    Depends: T01, T02           (cards that must PASS first)
+    Acceptance: `<command>`     (run by delegate -> ACCEPT: PASS/FAIL)
+
+Cards run in waves: a card starts once all its dependencies passed. Cards in a wave run in
+parallel (gemma ones one at a time, it has one slot). A failed card is retried once on the
+stronger model (hermes -> glm-5.3-flashx, gemma -> hermes). Cards whose dependency failed are
+skipped. Each passing wave is committed. Results go to RUN_SUMMARY.md next to tasks_dir.
+Time limits: each worker run is killed after DELEGATE_TIMEOUT seconds (default 600, see
+delegate) and counts as FAIL -> normal retry. The whole plan stops scheduling new waves after
+RUNPLAN_TIMEOUT seconds (default 2700); not-yet-started cards are marked SKIPPED.
+Passed cards are recorded in tasks/.passed; a rerun skips them, so after editing failed cards
+just run it again.
+"""
+import json, os, re, subprocess, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+RETRY_MODEL = "z-ai/glm-5.3-flashx"
+PLAN_TIMEOUT = float(os.environ.get("RUNPLAN_TIMEOUT", 45 * 60))  # whole-run deadline, seconds
+tasks_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "tasks").resolve()
+workdir = tasks_dir.parent
+gemma_lock = threading.Lock()
+
+
+def parse(card):
+    text = card.read_text()
+    field = lambda name: (re.search(rf"^{name}:\s*(.*)$", text, re.M | re.I) or [None, ""])[1].strip()
+    tier = field("Tier").lower().split()[0] if field("Tier") else "hermes"
+    deps = re.findall(r"T\d+", field("Depends"))
+    return {"id": card.stem, "path": card, "tier": tier if tier in ("hermes", "gemma") else "hermes",
+            "deps": deps, "attempts": [], "status": "pending"}
+
+
+def delegate(card, tier, model=None):
+    env = dict(os.environ)
+    if model:
+        env["HERMES_WORKER_MODEL"] = model
+    lock = gemma_lock if tier == "gemma" else None
+    if lock:
+        lock.acquire()
+    try:
+        out = subprocess.run(["delegate", tier, str(card["path"]), str(workdir)],
+                             capture_output=True, text=True, env=env).stdout
+    finally:
+        if lock:
+            lock.release()
+    log = (re.search(r"^LOG: (\S+)", out, re.M) or [None, ""])[1]
+    usage = {}
+    if log and Path(log.replace(".log", ".usage.json")).exists():
+        usage = json.loads(Path(log.replace(".log", ".usage.json")).read_text())
+    total = usage.get("total_including_auxiliary") or {}
+    return {"tier": tier, "model": usage.get("model") or model or tier,
+            "passed": "ACCEPT: PASS" in out,
+            "accept": (re.search(r"^ACCEPT: .*$", out, re.M) or [""])[0][:160],
+            "fallback": "FALLBACK:" in out,
+            "tokens": total.get("total_tokens") or usage.get("total_tokens") or 0,
+            "cost": total.get("estimated_cost_usd") or usage.get("estimated_cost_usd") or 0.0,
+            "log": log}
+
+
+def run_card(card):
+    first = delegate(card, card["tier"])
+    card["attempts"].append(first)
+    if not first["passed"]:
+        retry = delegate(card, "hermes", RETRY_MODEL) if card["tier"] == "hermes" else delegate(card, "hermes")
+        card["attempts"].append(retry)
+    card["status"] = "PASS" if card["attempts"][-1]["passed"] else "FAIL"
+    print(f"  {card['id']}: {card['status']} ({len(card['attempts'])} attempt(s))", flush=True)
+    return card
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", str(workdir), *args], capture_output=True, text=True)
+
+
+def main():
+    cards = {c.stem: parse(c) for c in sorted(tasks_dir.glob("T*.md"))}
+    if not cards:
+        sys.exit(f"run-plan: no T*.md cards in {tasks_dir}")
+    passed_file = tasks_dir / ".passed"
+    earlier = set(passed_file.read_text().split()) if passed_file.exists() else set()
+    for cid in earlier & cards.keys():
+        cards[cid]["status"] = "PASS"
+        cards[cid]["earlier"] = True
+    start, wave, plan_timed_out = time.time(), 0, False
+    while True:
+        for c in cards.values():   # skip cards whose dependency failed or is missing
+            if c["status"] == "pending" and any(cards.get(d, {}).get("status", "FAIL") in ("FAIL", "SKIPPED") for d in c["deps"]):
+                c["status"] = "SKIPPED"
+        ready = [c for c in cards.values() if c["status"] == "pending"
+                 and all(cards[d]["status"] == "PASS" for d in c["deps"])]
+        if not ready:
+            break
+        if time.time() - start > PLAN_TIMEOUT:
+            plan_timed_out = True
+            break
+        wave += 1
+        print(f"wave {wave}: {', '.join(c['id'] for c in ready)}", flush=True)
+        with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+            list(pool.map(run_card, ready))
+        passed = [c["id"] for c in ready if c["status"] == "PASS"]
+        with passed_file.open("a") as f:
+            f.writelines(cid + "\n" for cid in passed)
+        if passed:
+            git("add", "-A")
+            git("commit", "-q", "-m", f"run-plan wave {wave}: {', '.join(passed)}")
+    for c in cards.values():
+        if c["status"] == "pending":
+            c["status"] = "SKIPPED"   # dependency cycle, unknown dependency, or plan timeout
+
+    minutes = (time.time() - start) / 60
+    cost = sum(a["cost"] for c in cards.values() for a in c["attempts"])
+    tokens = sum(a["tokens"] for c in cards.values() for a in c["attempts"])
+    counts = {s: sum(c["status"] == s for c in cards.values()) for s in ("PASS", "FAIL", "SKIPPED")}
+    lines = ["# Run summary", "",
+             f"{counts['PASS']} PASS, {counts['FAIL']} FAIL, {counts['SKIPPED']} SKIPPED | "
+             f"{wave} wave(s) | {minutes:.1f} min | {tokens:,} worker tokens | ${cost:.4f}"
+             + (f" | PLAN TIMEOUT after {PLAN_TIMEOUT/60:.0f} min" if plan_timed_out else ""),
+             "",
+             "| Card | Tier | Status | Attempts (model: result) | Tokens | Cost |",
+             "|---|---|---|---|---|---|"]
+    for c in cards.values():
+        if c.get("earlier"):
+            lines.append(f"| {c['id']} | {c['tier']} | PASS | passed in an earlier run | - | - |")
+            continue
+        att = "; ".join(f"{a['model']}{' (fallback)' if a['fallback'] else ''}: {'PASS' if a['passed'] else 'FAIL'}"
+                        for a in c["attempts"]) or "-"
+        lines.append(f"| {c['id']} | {c['tier']} | {c['status']} | {att} | "
+                     f"{sum(a['tokens'] for a in c['attempts']):,} | ${sum(a['cost'] for a in c['attempts']):.4f} |")
+    failed = [c for c in cards.values() if c["status"] == "FAIL"]
+    if failed:
+        lines += ["", "## Failed cards (last attempt)"]
+        for c in failed:
+            a = c["attempts"][-1]
+            lines.append(f"- {c['id']}: {a['accept'] or 'no ACCEPT line'} | log: {a['log']}")
+    skipped = [c for c in cards.values() if c["status"] == "SKIPPED"]
+    if skipped:
+        lines += ["", "## Skipped (dependency failed or missing)"]
+        lines += [f"- {c['id']}: depends on {', '.join(c['deps'])}" for c in skipped]
+    (workdir / "RUN_SUMMARY.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines[:3]))
+    print(f"summary: {workdir / 'RUN_SUMMARY.md'}")
+    sys.exit(0 if not failed and not skipped else 1)
+
+
+if __name__ == "__main__":
+    main()

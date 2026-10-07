@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Launch Claude Code in orchestration mode for the current project.
+#   orc ["build X"]           -> default mode: Claude plans + writes cards, `run-plan` sends every
+#                                card to Hermes/Gemma with no Claude in the loop, then Claude
+#                                checks the result and writes REPORT.md (protocol.md).
+#                                One model for the whole session (one cache write): Sonnet.
+#   orc --phased ["build X"]  -> old mode: Claude dispatches and QAs phase by phase
+#                                (protocol-phased.md), Opus plans / Sonnet works (opusplan).
+# Both start in plan mode. Override: ORC_MODEL=opus|sonnet|opusplan, ORC_EFFORT=high.
+# Token savers: medium effort, no skills, no MCP servers, only the 5 built-in tools orc needs
+# (context per turn 18.2K -> 11.8K). Add tools with ORC_TOOLS="Bash,Read,Write,Edit,ExitPlanMode,Grep".
+# Also reachable as `claude orc ...` via the zsh wrapper in ~/.zshrc.
+set -euo pipefail
+
+mode=lite
+if [[ "${1:-}" == --phased ]]; then mode=phased; shift; fi
+
+# Refuse non-project folders: scaffolding here would turn them into a git repo.
+case "$PWD" in
+  "$HOME"|/|"$HOME/Desktop"|"$HOME/Documents"|"$HOME/Downloads")
+    echo "orc: run this inside a project folder, not $PWD" >&2
+    echo "     e.g. mkdir ~/flappy && cd ~/flappy && claude orc" >&2
+    exit 1 ;;
+esac
+
+# Project scaffold (idempotent).
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || git init -q
+mkdir -p tasks
+[[ -f tasks/_TEMPLATE.md ]] || cat > tasks/_TEMPLATE.md <<'EOF'
+# T00: <title>
+Goal: <one sentence>
+Tier: hermes | gemma
+Depends: <T01, T02, or none>
+Files to touch: <paths>
+Do not touch: <paths, or "anything else">
+Context: see tasks/CONTEXT.md; <interfaces/signatures this card implements>
+Acceptance: `<one read-only command>` exits 0
+EOF
+[[ -f PLAN.md ]] || printf '# Plan\n\n(no tasks yet)\n' > PLAN.md
+
+# Warm up Gemma in the background so the first gemma task does not wait.
+(gemma-up >/dev/null 2>&1 &)
+
+if [[ $mode == phased ]]; then
+  model="${ORC_MODEL:-opusplan}"; protocol="$HOME/.config/orc/protocol-phased.md"
+else
+  model="${ORC_MODEL:-sonnet}";   protocol="$HOME/.config/orc/protocol.md"
+fi
+flags=(--model "$model" --permission-mode plan --effort "${ORC_EFFORT:-medium}"
+       --disable-slash-commands --tools "${ORC_TOOLS:-Bash,Read,Write,Edit,ExitPlanMode}"
+       --strict-mcp-config --mcp-config "$HOME/.config/orc/empty-mcp.json"
+       --append-system-prompt-file "$protocol")
+if [[ $# -gt 0 ]]; then
+  exec claude "${flags[@]}" "Use the orchestration pipeline. Goal: $*"
+else
+  exec claude "${flags[@]}"
+fi
